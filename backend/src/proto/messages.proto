@@ -1,0 +1,41 @@
+syntax = "proto2";
+
+package messages;
+
+message ClientMessage {
+  oneof content {
+    GroupStateUpdate state_update = 1;
+    MemberOffer offer = 2;
+    MemberAnswer answer = 3;
+    MemberIceCandidate ice_candidate = 4;
+  }
+}
+
+message GroupStateUpdate {
+  repeated string active_member_ids = 1;
+}
+
+message MemberOffer {
+  required string member_id = 1;
+  required string offer_sdp = 2;
+}
+
+message MemberAnswer {
+  required string member_id = 1;
+  required string answer_sdp = 2;
+}
+
+message MemberIceCandidate {
+  required string member_id = 1;
+  required string candidate = 2;
+  required int32 sdp_mline_index = 3;
+  optional string sdp_mid = 4;
+}
+
+message Command {
+  oneof content {
+    MemberOffer offer = 1;
+    MemberAnswer answer = 2;
+    MemberIceCandidate ice_candidate = 3;
+  }
+}
