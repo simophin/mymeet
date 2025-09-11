@@ -11,8 +11,12 @@ message ClientMessage {
   }
 }
 
+message MemberState {
+  required string name = 1;
+}
+
 message GroupStateUpdate {
-  repeated string active_member_ids = 1;
+  map<string, MemberState> members = 1;
 }
 
 message MemberOffer {
