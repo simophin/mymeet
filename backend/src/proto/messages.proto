@@ -2,6 +2,8 @@ syntax = "proto2";
 
 package messages;
 
+option java_package = "dev.fanchao.mymeet.proto";
+
 message ClientMessage {
   oneof content {
     GroupStateUpdate state_update = 1;

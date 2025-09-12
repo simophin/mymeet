@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Cpxy"
+rootProject.name = "myMeet"
 include(":app")
