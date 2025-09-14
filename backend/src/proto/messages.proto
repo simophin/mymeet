@@ -5,11 +5,13 @@ package messages;
 option java_package = "dev.fanchao.mymeet.proto";
 
 message ClientMessage {
+  optional string from_user = 1;
+
   oneof content {
-    GroupStateUpdate state_update = 1;
-    MemberOffer offer = 2;
-    MemberAnswer answer = 3;
-    MemberIceCandidate ice_candidate = 4;
+    GroupStateUpdate state_update = 2;
+    string offer = 3;
+    string answer = 4;
+    IceCandidate ice_candidate = 5;
   }
 }
 
@@ -21,27 +23,18 @@ message GroupStateUpdate {
   map<string, MemberState> members = 1;
 }
 
-message MemberOffer {
-  required string member_id = 1;
-  required string offer_sdp = 2;
-}
-
-message MemberAnswer {
-  required string member_id = 1;
-  required string answer_sdp = 2;
-}
-
-message MemberIceCandidate {
-  required string member_id = 1;
+message IceCandidate {
   required string candidate = 2;
   required int32 sdp_mline_index = 3;
   optional string sdp_mid = 4;
 }
 
 message Command {
+  optional string to_user = 1;
+
   oneof content {
-    MemberOffer offer = 1;
-    MemberAnswer answer = 2;
-    MemberIceCandidate ice_candidate = 3;
+    string offer = 2;
+    string answer = 3;
+    IceCandidate ice_candidate = 4;
   }
 }

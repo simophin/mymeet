@@ -29,6 +29,14 @@ class Preferences(appContext: Context, json: Json) {
         notificationFlow = notificationFlow,
         serializer = ListSerializer(String.serializer()),
     )
+
+    var userId: String?
+        get() = prefs.getString("USER_ID", null)
+        set(value) {
+            prefs.edit {
+                putString("USER_ID", value)
+            }
+        }
 }
 
 class JsonPreferenceValue<T: Any>(

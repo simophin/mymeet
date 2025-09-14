@@ -1,6 +1,6 @@
 use crate::room::{AppState, handle_room_request};
 use axum::Router;
-use axum::routing::post;
+use axum::routing::get;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ mod user;
 
 #[derive(Parser)]
 struct CliOptions {
-    #[arg(default_value = "127.0.0.1:3000", env)]
+    #[arg(default_value = "0.0.0.0:3000", env)]
     /// Address to listen to
     listen: SocketAddr,
 }
@@ -25,7 +25,7 @@ async fn main() {
     let CliOptions { listen } = CliOptions::parse();
 
     let app = Router::new()
-        .route("/rooms/{room_id}", post(handle_room_request))
+        .route("/rooms/{room}", get(handle_room_request))
         .with_state(Arc::new(AppState::default()));
 
     // run our app with hyper, listening globally on port 3000

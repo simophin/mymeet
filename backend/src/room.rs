@@ -47,40 +47,45 @@ impl RoomState {
             while let Some(cmd) = commands_rx.recv().await {
                 match cmd {
                     RoomCommand::JoinRoom(User { id, name }, message_sender) => {
-                        clients_tx.send_modify(|m| {
-                            m.insert(
-                                id,
-                                ClientState {
-                                    name,
-                                    message_sender,
-                                },
-                            );
-                        });
+                        let state = ClientState {
+                            name,
+                            message_sender,
+                        };
+
+                        clients_tx.send_if_modified(move |m| m.insert(id, state).is_none());
                     }
 
                     RoomCommand::LeaveRoom { user_id } => {
+                        tracing::debug!("User {user_id} leaving room");
                         clients_tx.send_if_modified(|m| m.remove(&user_id).is_some());
                     }
 
                     RoomCommand::UserCommand {
                         from_user_id,
-                        message: Command { content },
+                        message:
+                            Command {
+                                to_user: Some(target_user_id),
+                                content,
+                            },
                     } => {
-                        let (target_user_id, m) = match content {
-                            Some(command::Content::Answer(answer)) => (
-                                answer.member_id.clone(),
-                                client_message::Content::Answer(answer),
-                            ),
+                        tracing::debug!(
+                            from_user_id,
+                            target_user_id,
+                            ?content,
+                            "Received user command"
+                        );
+                        let content = match content {
+                            Some(command::Content::Answer(answer)) => {
+                                client_message::Content::Answer(answer)
+                            }
 
-                            Some(command::Content::Offer(offer)) => (
-                                offer.member_id.clone(),
-                                client_message::Content::Offer(offer),
-                            ),
+                            Some(command::Content::Offer(offer)) => {
+                                client_message::Content::Offer(offer)
+                            }
 
-                            Some(command::Content::IceCandidate(candidate)) => (
-                                candidate.member_id.clone(),
-                                client_message::Content::IceCandidate(candidate),
-                            ),
+                            Some(command::Content::IceCandidate(candidate)) => {
+                                client_message::Content::IceCandidate(candidate)
+                            }
 
                             None => {
                                 tracing::warn!("Received empty command from user {}", from_user_id);
@@ -92,9 +97,15 @@ impl RoomState {
                             .borrow()
                             .get(&target_user_id)
                             .map(|s| s.message_sender.clone());
+
                         match target_sender {
                             Some(s) => {
-                                let _ = s.send(ClientMessage { content: Some(m) }).await;
+                                let _ = s
+                                    .send(ClientMessage {
+                                        content: Some(content),
+                                        from_user: Some(from_user_id),
+                                    })
+                                    .await;
                             }
 
                             None => {
@@ -102,6 +113,8 @@ impl RoomState {
                             }
                         }
                     }
+
+                    _ => tracing::warn!("Unknown command received"),
                 }
             }
 
@@ -168,6 +181,7 @@ async fn handle_websocket(room: String, mut ws: WebSocket, user: User, state: Ar
             }
 
             Ok(_) = clients_rx.changed() => {
+                tracing::debug!("Client states changed");
                 if let Err(e) = ws.send(recv_group_state_update(&clients_rx)).await {
                     break Err(format_err!("Error sending group state update to websocket: {}", e));
                 }
@@ -179,6 +193,8 @@ async fn handle_websocket(room: String, mut ws: WebSocket, user: User, state: Ar
 
     if let Err(e) = &r {
         tracing::error!(?e, "Error handling room logic")
+    } else {
+        tracing::info!("WebSocket closed normally");
     }
 
     let _ = commands_tx
@@ -188,6 +204,7 @@ async fn handle_websocket(room: String, mut ws: WebSocket, user: User, state: Ar
 
 fn recv_group_state_update(rx: &watch::Receiver<HashMap<String, ClientState>>) -> Message {
     let buf = ClientMessage {
+        from_user: None,
         content: Some(client_message::Content::StateUpdate(GroupStateUpdate {
             members: rx
                 .borrow()
@@ -214,7 +231,10 @@ async fn recv_command_from_websocket(ws: &mut WebSocket) -> Option<anyhow::Resul
             Ok(Message::Binary(binary)) => {
                 return Some(Command::decode(binary.as_ref()).context("Error decoding command"));
             }
-            Ok(_) => continue,
+            Ok(m) => {
+                tracing::warn!(?m, "Ignoring websocket message");
+                continue;
+            }
             Err(e) => return Some(Err(anyhow::Error::new(e))),
         }
     }

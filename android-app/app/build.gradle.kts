@@ -98,6 +98,8 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.navigation.compose)
     implementation(libs.webrtc.android)
+    implementation(libs.webrtc.android.compose)
+    implementation(libs.webrtc.android.ktx)
     implementation(libs.ktor.client.cio)
     implementation(libs.ktor.client.websockets)
     implementation(libs.protobuf.lite)

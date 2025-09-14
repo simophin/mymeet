@@ -1,0 +1,127 @@
+package dev.fanchao.mymeet
+
+import android.util.Log
+import dev.fanchao.mymeet.proto.Messages
+import io.ktor.client.HttpClient
+import io.ktor.client.plugins.websocket.webSocket
+import io.ktor.http.HttpMethod
+import io.ktor.http.URLBuilder
+import io.ktor.http.appendPathSegments
+import io.ktor.websocket.Frame
+import io.ktor.websocket.close
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.channels.SendChannel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.selects.selectUnbiased
+
+sealed interface WebSocketConnState {
+    data class Connecting(val lastError: Throwable? = null) : WebSocketConnState
+    data object Connected : WebSocketConnState
+}
+
+private const val TAG = "WebSocketStream"
+
+fun CoroutineScope.createWebSocketConnection(
+    url: String,
+    room: String,
+    userId: String,
+    userName: String,
+    client: HttpClient,
+): Triple<SendChannel<Messages.Command>, ReceiveChannel<Messages.ClientMessage>, StateFlow<WebSocketConnState>> {
+    val commandChannel = Channel<Messages.Command>()
+    val clientMessagesChannel = Channel<Messages.ClientMessage>()
+
+    val states = channelFlow {
+        while (true) {
+            try {
+                connect(
+                    client = client,
+                    url = url,
+                    room = room,
+                    userId = userId,
+                    userName = userName,
+                    commandChannel = commandChannel,
+                    clientMessagesChannel = clientMessagesChannel
+                ) {
+                    send(WebSocketConnState.Connected)
+                }
+
+                return@channelFlow
+            } catch (e: CancellationException) {
+                commandChannel.close()
+                clientMessagesChannel.close()
+                throw e
+            } catch (e: Throwable) {
+                Log.e(TAG, "Connection error", e)
+                send(WebSocketConnState.Connecting(e))
+                delay(2000)
+            }
+        }
+    }.stateIn(this, SharingStarted.Eagerly, WebSocketConnState.Connecting())
+
+    return Triple(commandChannel, clientMessagesChannel, states)
+}
+
+private suspend fun connect(
+    client: HttpClient,
+    url: String,
+    room: String,
+    userId: String,
+    userName: String,
+    commandChannel: ReceiveChannel<Messages.Command>,
+    clientMessagesChannel: SendChannel<Messages.ClientMessage>,
+    connectedCallback: suspend () -> Unit
+) {
+    client.webSocket(
+        urlString = URLBuilder(url)
+            .appendPathSegments("rooms", room)
+            .toString(),
+        request = {
+            method = HttpMethod.Get
+            headers["X-User-Id"] = userId
+            headers["X-User-Name"] = userName
+        }
+    ) {
+        connectedCallback()
+
+        var running = true
+
+        while (running) {
+            selectUnbiased {
+                commandChannel.onReceiveCatching { cmd ->
+                    if (cmd.isSuccess) {
+                        Log.d(TAG, "About to send ws command: ${cmd.getOrThrow()}")
+                        send(Frame.Binary(true, cmd.getOrThrow().toByteArray()))
+                    } else {
+                        close()
+                        running = false
+                    }
+                }
+
+                incoming.onReceive { frame ->
+                    val message = (frame as? Frame.Binary)?.data?.let {
+                        runCatching {
+                            Messages.ClientMessage.parseFrom(it)
+                        }.onFailure { e ->
+                            Log.e(TAG, "Failed to parse message", e)
+                        }.getOrNull()
+                    }
+
+                    if (message != null) {
+                        Log.e(TAG, "Received ws message $message")
+                        clientMessagesChannel.send(message)
+                    }
+                }
+            }
+        }
+    }
+
+}
