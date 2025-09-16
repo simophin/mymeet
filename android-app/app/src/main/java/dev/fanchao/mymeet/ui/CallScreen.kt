@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
@@ -23,6 +24,7 @@ import org.webrtc.EglBase
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceTextureHelper
+import org.webrtc.VideoTrack
 import java.util.UUID
 import kotlin.math.floor
 
@@ -49,14 +51,16 @@ fun CallScreen(
 
     val localVideoTrack = remember(Unit) {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraName = manager
-            .cameraIdList
-            .asSequence()
-            .filter {
-                manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
-                        CameraCharacteristics.LENS_FACING_FRONT
-            }
-            .firstOrNull()
+        val cameraName = manager.cameraIdList.let { list ->
+            list.asSequence()
+                .filter {
+                    manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
+                            CameraCharacteristics.LENS_FACING_FRONT
+                }
+                .firstOrNull()
+                ?: list.firstOrNull()
+        }
+
 
         val surfaceTextureHelper = SurfaceTextureHelper.create(
             "SurfaceTextureHelperThread",
@@ -66,7 +70,11 @@ fun CallScreen(
         val capturer = Camera2Capturer(context, cameraName, null)
         val source = peerConnectionFactory.createVideoSource(capturer.isScreencast)
 
-        capturer.initialize(surfaceTextureHelper, context.applicationContext, source.capturerObserver)
+        capturer.initialize(
+            surfaceTextureHelper,
+            context.applicationContext,
+            source.capturerObserver
+        )
         capturer.startCapture(480, 720, 30)
 
         peerConnectionFactory.createVideoTrack(
@@ -79,11 +87,17 @@ fun CallScreen(
         callSessionManager.setLocalVideoTrack(localVideoTrack)
     }
 
+    DisposableEffect(localVideoTrack) {
+        onDispose {
+            localVideoTrack.dispose()
+        }
+    }
+
     val allVideoTracks = remember(states) {
         (sequenceOf(localVideoTrack) + states.value.values
             .asSequence()
-            .flatMap { it.streams.asSequence() }
-            .flatMap { it.videoTracks.asSequence() })
+            .flatMap { it.tracks.asSequence() })
+            .filterIsInstance<VideoTrack>()
             .toList()
     }
 

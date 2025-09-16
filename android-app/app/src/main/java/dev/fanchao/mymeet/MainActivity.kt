@@ -48,14 +48,14 @@ class MainActivity : ComponentActivity() {
 
         val callSessionManager = CallSessionManager(
             userId = userId,
-            url = "ws://172.19.132.15:3000",
+            url = "ws://192.168.8.235:3000",
             userName = android.os.Build.MODEL,
             client = appInstance.ktorClient,
             room = "test room",
             peerConnectionFactory = appInstance.peerConnectionFactory,
             iceServers = listOf(
-                PeerConnection.IceServer.builder("stun:stun.infra.net:3478").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun.miwifi.com:3478").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun.l.google.com:5349").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
             ),
             scope = lifecycleScope
         )

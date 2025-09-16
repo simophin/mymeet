@@ -36,8 +36,8 @@ fun CoroutineScope.createWebSocketConnection(
     userName: String,
     client: HttpClient,
 ): Triple<SendChannel<Messages.Command>, ReceiveChannel<Messages.ClientMessage>, StateFlow<WebSocketConnState>> {
-    val commandChannel = Channel<Messages.Command>()
-    val clientMessagesChannel = Channel<Messages.ClientMessage>()
+    val commandChannel = Channel<Messages.Command>(capacity = 32)
+    val clientMessagesChannel = Channel<Messages.ClientMessage>(capacity = 32)
 
     val states = channelFlow {
         while (true) {
@@ -80,6 +80,7 @@ private suspend fun connect(
     clientMessagesChannel: SendChannel<Messages.ClientMessage>,
     connectedCallback: suspend () -> Unit
 ) {
+    Log.d(TAG, "Connecting to $url")
     client.webSocket(
         urlString = URLBuilder(url)
             .appendPathSegments("rooms", room)
@@ -90,6 +91,7 @@ private suspend fun connect(
             headers["X-User-Name"] = userName
         }
     ) {
+        Log.d(TAG, "Connected to $url")
         connectedCallback()
 
         var running = true
@@ -101,6 +103,7 @@ private suspend fun connect(
                         Log.d(TAG, "About to send ws command: ${cmd.getOrThrow()}")
                         send(Frame.Binary(true, cmd.getOrThrow().toByteArray()))
                     } else {
+                        Log.d(TAG, "Command channel closed. Exiting...")
                         close()
                         running = false
                     }
@@ -116,7 +119,7 @@ private suspend fun connect(
                     }
 
                     if (message != null) {
-                        Log.e(TAG, "Received ws message $message")
+                        Log.d(TAG, "Received ws message $message")
                         clientMessagesChannel.send(message)
                     }
                 }
