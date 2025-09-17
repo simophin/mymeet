@@ -1,6 +1,4 @@
-use crate::proto::messages::{
-    ClientMessage, Command, GroupStateUpdate, MemberState, client_message, command,
-};
+use crate::proto::messages::{ClientMessage, Command, GroupStateUpdate, MemberState, client_message, ServerMessage, server_message};
 use crate::user::User;
 use anyhow::{Context, format_err};
 use axum::extract::ws::{Message, WebSocket};
@@ -27,7 +25,8 @@ enum RoomCommand {
     },
     UserCommand {
         from_user_id: String,
-        message: Command,
+        to_user_id: String,
+        cmd: Command,
     },
 }
 
@@ -62,59 +61,35 @@ impl RoomState {
 
                     RoomCommand::UserCommand {
                         from_user_id,
-                        message:
-                            Command {
-                                to_user: Some(target_user_id),
-                                content,
-                            },
+                        to_user_id,
+                        cmd,
                     } => {
                         tracing::debug!(
                             from_user_id,
-                            target_user_id,
-                            ?content,
+                            ?cmd,
                             "Received user command"
                         );
-                        let content = match content {
-                            Some(command::Content::Answer(answer)) => {
-                                client_message::Content::Answer(answer)
-                            }
-
-                            Some(command::Content::Offer(offer)) => {
-                                client_message::Content::Offer(offer)
-                            }
-
-                            Some(command::Content::IceCandidate(candidate)) => {
-                                client_message::Content::IceCandidate(candidate)
-                            }
-
-                            None => {
-                                tracing::warn!("Received empty command from user {}", from_user_id);
-                                continue;
-                            }
-                        };
 
                         let target_sender = clients_tx
                             .borrow()
-                            .get(&target_user_id)
+                            .get(&to_user_id)
                             .map(|s| s.message_sender.clone());
 
                         match target_sender {
                             Some(s) => {
                                 let _ = s
                                     .send(ClientMessage {
-                                        content: Some(content),
                                         from_user: Some(from_user_id),
+                                        content: Some(client_message::Content::Command(cmd)),
                                     })
                                     .await;
                             }
 
                             None => {
-                                tracing::warn!("Sender not found for user id {}", target_user_id);
+                                tracing::warn!("Sender not found for user id {to_user_id}");
                             }
                         }
                     }
-
-                    _ => tracing::warn!("Unknown command received"),
                 }
             }
 
@@ -167,12 +142,28 @@ async fn handle_websocket(room: String, mut ws: WebSocket, user: User, state: Ar
                 }
             }
 
-            Some(m) = recv_command_from_websocket(&mut ws) => {
-                match m {
-                    Ok(cmd) => {
+            Some(msg) = recv_command_from_websocket(&mut ws) => {
+                match msg {
+                    Ok(ServerMessage { to_user, content}) => {
+                        if Some(&user.id) == to_user.as_ref() {
+                            tracing::warn!("Ignoring command sent to self");
+                            continue;
+                        }
+
+                        let Some(to_user_id) = to_user else {
+                            tracing::warn!("Ignoring command with no target user");
+                            continue;
+                        };
+
+                        let Some(server_message::Content::Command(cmd)) = content else {
+                            tracing::warn!("Ignoring command with no content");
+                            continue;
+                        };
+
                         let _ = commands_tx.send(RoomCommand::UserCommand {
                             from_user_id: user.id.clone(),
-                            message: cmd,
+                            to_user_id,
+                            cmd,
                         }).await;
                     }
 
@@ -225,11 +216,11 @@ fn recv_group_state_update(rx: &watch::Receiver<HashMap<String, ClientState>>) -
     Message::Binary(buf.into())
 }
 
-async fn recv_command_from_websocket(ws: &mut WebSocket) -> Option<anyhow::Result<Command>> {
+async fn recv_command_from_websocket(ws: &mut WebSocket) -> Option<anyhow::Result<ServerMessage>> {
     while let Some(msg) = ws.recv().await {
         match msg {
             Ok(Message::Binary(binary)) => {
-                return Some(Command::decode(binary.as_ref()).context("Error decoding command"));
+                return Some(ServerMessage::decode(binary.as_ref()).context("Error decoding ServerMessage"));
             }
             Ok(m) => {
                 tracing::warn!(?m, "Ignoring websocket message");

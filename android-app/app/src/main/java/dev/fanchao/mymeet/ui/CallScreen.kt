@@ -5,6 +5,9 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
@@ -12,10 +15,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import dev.fanchao.mymeet.App.Companion.appInstance
 import dev.fanchao.mymeet.CallSessionManager
 import io.getstream.webrtc.android.compose.VideoRenderer
 import kotlinx.serialization.Serializable
@@ -26,6 +32,7 @@ import org.webrtc.RendererCommon
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoTrack
 import java.util.UUID
+import kotlin.math.ceil
 import kotlin.math.floor
 
 @Serializable
@@ -41,15 +48,13 @@ fun CallScreen(
     callSessionManager: CallSessionManager,
     peerConnectionFactory: PeerConnectionFactory,
 ) {
-    val states = callSessionManager.memberStates.collectAsState()
-
-    val eglBaseContext = remember {
-        EglBase.create()
-    }
+    val states by callSessionManager.memberStates.collectAsState()
 
     val context = LocalContext.current
 
-    val localVideoTrack = remember(Unit) {
+    val eglBaseContext = remember(context) { context.appInstance.eglBase.eglBaseContext }
+
+    val localStream = remember(Unit) {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val cameraName = manager.cameraIdList.let { list ->
             list.asSequence()
@@ -64,7 +69,7 @@ fun CallScreen(
 
         val surfaceTextureHelper = SurfaceTextureHelper.create(
             "SurfaceTextureHelperThread",
-            eglBaseContext.eglBaseContext
+            eglBaseContext
         )
 
         val capturer = Camera2Capturer(context, cameraName, null)
@@ -77,26 +82,24 @@ fun CallScreen(
         )
         capturer.startCapture(480, 720, 30)
 
-        peerConnectionFactory.createVideoTrack(
+        val videoTrack = peerConnectionFactory.createVideoTrack(
             "video_track_${UUID.randomUUID()}",
             source
         )
+
+        val mediaStream = peerConnectionFactory.createLocalMediaStream("local")
+        mediaStream.addTrack(videoTrack)
+
+        mediaStream
     }
 
-    LaunchedEffect(localVideoTrack) {
-        callSessionManager.setLocalVideoTrack(localVideoTrack)
-    }
-
-    DisposableEffect(localVideoTrack) {
-        onDispose {
-            localVideoTrack.dispose()
-        }
+    LaunchedEffect(localStream) {
+        callSessionManager.setLocalStream(localStream)
     }
 
     val allVideoTracks = remember(states) {
-        (sequenceOf(localVideoTrack) + states.value.values
-            .asSequence()
-            .flatMap { it.tracks.asSequence() })
+        (localStream.videoTracks.asSequence() +
+                states.values.asSequence().flatMap { it.tracks.asSequence() })
             .filterIsInstance<VideoTrack>()
             .toList()
     }
@@ -104,32 +107,38 @@ fun CallScreen(
     Scaffold { paddings ->
         BoxWithConstraints(modifier = Modifier.padding(paddings)) {
             val numColumns = floor(maxWidth / 240.dp).toInt().coerceAtLeast(1)
-            val numRows = floor(maxHeight / 240.dp).toInt().coerceAtLeast(1)
+            val numRows = ceil(allVideoTracks.size / numColumns.toFloat()).toInt().coerceAtLeast(1)
 
+            Column(modifier = Modifier.fillMaxSize()) {
+                repeat(numRows) { i ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                    ) {
+                        repeat(numColumns) { j ->
+                            val videoTrack = allVideoTracks.getOrNull(i * numColumns + j)
+                            if (videoTrack != null) {
+                                VideoRenderer(
+                                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                                    videoTrack = videoTrack,
+                                    eglBaseContext = eglBaseContext,
+                                    rendererEvents = remember {
+                                        object : RendererCommon.RendererEvents {
+                                            override fun onFirstFrameRendered() {
+                                            }
 
-            repeat(numRows) { i ->
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    repeat(numColumns) { j ->
-                        val videoTrack = allVideoTracks.getOrNull(i * numColumns + j)
-                        if (videoTrack != null) {
-                            VideoRenderer(
-                                modifier = Modifier.weight(1f),
-                                videoTrack = videoTrack,
-                                eglBaseContext = eglBaseContext.eglBaseContext,
-                                rendererEvents = remember {
-                                    object : RendererCommon.RendererEvents {
-                                        override fun onFirstFrameRendered() {
-                                        }
-
-                                        override fun onFrameResolutionChanged(
-                                            videoWidth: Int,
-                                            videoHeight: Int,
-                                            rotation: Int
-                                        ) {
+                                            override fun onFrameResolutionChanged(
+                                                videoWidth: Int,
+                                                videoHeight: Int,
+                                                rotation: Int
+                                            ) {
+                                            }
                                         }
                                     }
-                                }
-                            )
+                                )
+                            }
                         }
                     }
                 }

@@ -4,27 +4,30 @@ import android.util.Log
 import dev.fanchao.mymeet.proto.Messages
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.flow.FlowCollector
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.produceIn
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.selectUnbiased
-import org.webrtc.DataChannel
-import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
 import org.webrtc.MediaStreamTrack
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
-import org.webrtc.RtpReceiver
 import org.webrtc.SessionDescription
-import org.webrtc.VideoTrack
-import kotlin.collections.plus
 
 private const val TAG = "CallSessionManager"
 
@@ -39,348 +42,275 @@ class CallSessionManager(
     scope: CoroutineScope,
 ) {
     data class MemberState(
-        val userId: String,
+        val userName: String,
         val tracks: List<MediaStreamTrack>,
         val iceConnectionState: PeerConnection.IceConnectionState,
     )
 
     private class PeerConnectionData(
-        var state: MemberState,
-        val conn: PeerConnection,
-        val events: ReceiveChannel<PeerConnectionEvent>
+        var states: MutableStateFlow<MemberState>,
+        val incomingCommands: SendChannel<Messages.Command>,
+        val operationSender: SendChannel<Operation>,
+        val job: Job,
     )
 
-    private sealed interface PeerConnectionEvent {
-        data class TrackAdded(val receiver: RtpReceiver) : PeerConnectionEvent
-        data class TrackRemoved(val receiver: RtpReceiver) : PeerConnectionEvent
-        data class NewIceCandidate(val iceCandidate: IceCandidate) : PeerConnectionEvent
-        data class IceCandidateStateChanged(val state: PeerConnection.IceConnectionState) :
-            PeerConnectionEvent
-
-        data object RenegotiationNeeded : PeerConnectionEvent
-    }
-
     private sealed interface Operation {
-        data class AddTrack(val track: MediaStreamTrack, val callback: SendChannel<Result<Unit>>) :
-            Operation
-
+        data class SetLocalStream(val stream: MediaStream) : Operation
     }
 
     private val operations = Channel<Operation>(capacity = 25)
 
-    private val mediaConstraints = MediaConstraints()
+    private val mediaConstraints = MediaConstraints().apply {
+//        mandatory.add(MediaConstraints.KeyValuePair("audio", "true"))
+        mandatory.add(MediaConstraints.KeyValuePair("video", "true"))
+    }
 
-    private class States(
-        val commandSender: SendChannel<Messages.Command>,
-        val peerConnections: MutableMap<String, PeerConnectionData> = mutableMapOf(),
-        val localTracks: MutableList<MediaStreamTrack> = mutableListOf(),
-    )
-
-    val memberStates = flow {
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val memberStates: StateFlow<Map<String, MemberState>> = flow {
         coroutineScope {
             val (commandSender, messageReceiver, connState) = createWebSocketConnection(
                 url = url, room = room, userId = userId, userName = userName, client = client
             )
 
-            val states = States(commandSender = commandSender)
-
+            val peerConnections: MutableMap<String, PeerConnectionData> = mutableMapOf()
+            var localStream: MediaStream? = null
             val connStateReceiver = connState.produceIn(this)
 
             try {
                 while (true) {
                     selectUnbiased {
-                        // Listen for all events coming from peer connection
-                        for (conn in states.peerConnections.values) {
-                            conn.events.onReceive { event ->
-                                handlePeerConnectionEvent(
-                                    conn = conn,
-                                    states = states,
-                                    event = event
-                                )
+                        // Listen for any incoming messages
+                        messageReceiver.onReceive { m ->
+                            when (m.contentCase) {
+                                Messages.ClientMessage.ContentCase.STATE_UPDATE -> {
+                                    // Remove peer connections that are no longer present
+                                    (peerConnections.keys - m.stateUpdate.membersMap.keys).forEach { toRemove ->
+                                        peerConnections.remove(toRemove)?.let { conn ->
+                                            Log.d(TAG, "Removing connection to $toRemove")
+                                            conn.job.cancel()
+                                        }
+                                    }
+
+                                    // Add new peer connections
+                                    (m.stateUpdate.membersMap.keys - peerConnections.keys - userId)
+                                        .forEach { newUserId ->
+                                            val states = MutableStateFlow(
+                                                MemberState(
+                                                    userName = "",
+                                                    tracks = emptyList(),
+                                                    iceConnectionState = PeerConnection.IceConnectionState.NEW,
+                                                )
+                                            )
+
+                                            val operationChannel = Channel<Operation>()
+                                            val incomingMessages = Channel<Messages.Command>()
+
+                                            val job = launch {
+                                                serveConnection(
+                                                    remoteUserId = newUserId,
+                                                    states = states,
+                                                    initialLocalStream = localStream,
+                                                    operationReceiver = operationChannel,
+                                                    commandsReceiver = incomingMessages,
+                                                    commandSender = commandSender,
+                                                )
+                                            }
+
+                                            peerConnections[newUserId] = PeerConnectionData(
+                                                states = states,
+                                                incomingCommands = incomingMessages,
+                                                job = job,
+                                                operationSender = operationChannel,
+                                            )
+                                        }
+
+                                    // Update user names if applicable
+                                    m.stateUpdate.membersMap.forEach { (id, data) ->
+                                        if (data.hasName()) {
+                                            peerConnections[id]?.states?.update {
+                                                it.copy(userName = data.name)
+                                            }
+                                        }
+                                    }
+
+                                    // Emit state updates
+                                    emit(peerConnections.toMap())
+                                }
+
+                                Messages.ClientMessage.ContentCase.COMMAND -> {
+                                    if (m.hasFromUser()) {
+                                        peerConnections[m.fromUser]?.incomingCommands?.send(
+                                            m.command
+                                        )
+                                    }
+                                }
+
+                                Messages.ClientMessage.ContentCase.CONTENT_NOT_SET -> {
+                                    Log.w(TAG, "Received unknown message")
+                                }
                             }
                         }
 
-                        // Listen for any incoming messages
-                        messageReceiver.onReceive { m ->
-                            handleIncomingMessage(states, m)
-                        }
-
-                        // Listen for any local operations
-                        operations.onReceive { op ->
-                            handleLocalOperation(states, op)
-                        }
 
                         // Listen for websocket state
                         connStateReceiver.onReceive { state ->
                             Log.d(TAG, "WebSocket connection state: $state")
                         }
+
+                        // Listen for operations
+                        operations.onReceive { op ->
+                            when (op) {
+                                is Operation.SetLocalStream -> {
+                                    localStream = op.stream
+
+                                    peerConnections.forEach { (_, conn) ->
+                                        conn.operationSender.send(op)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } finally {
-                for (conn in states.peerConnections.values) {
-                    conn.conn.dispose()
+                for (c in peerConnections) {
+                    c.value.job.cancel()
                 }
 
                 commandSender.close()
+                localStream?.dispose()
             }
+        }
+    }.flatMapLatest { peerConnections ->
+        combine(
+            peerConnections
+            .asSequence()
+            .map { (id, data) -> data.states.map { states -> id to states } }
+            .asIterable()
+        ) {
+            it.associate { (id, state) -> id to state }
         }
     }.stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
-    private suspend fun createPeerConnectionData(
-        userId: String,
-        localTracks: List<MediaStreamTrack>,
-        createLocalOffer: Boolean
-    ): Pair<PeerConnectionData, SessionDescription?> {
-        val events = Channel<PeerConnectionEvent>(capacity = 100)
-        val conn = peerConnectionFactory.createPeerConnection(
-            iceServers,
-            object : PeerConnection.Observer {
-                override fun onIceCandidate(candidate: IceCandidate) {
-                    Log.d(TAG, "WEBRTC: onIceCandidate: $candidate")
-                    events.trySend(PeerConnectionEvent.NewIceCandidate(candidate))
-                }
 
-                override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {
-                    Log.d(TAG, "WEBRTC: onIceConnectionChange: $newState")
-                    events.trySend(PeerConnectionEvent.IceCandidateStateChanged(newState))
-                }
-
-                override fun onSignalingChange(newState: PeerConnection.SignalingState?) {
-                    Log.d(TAG, "WEBRTC: onSignalingChange: $newState")
-                }
-
-                override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-                override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {
-                    Log.d(TAG, "WEBRTC: onIceGatheringChange: $newState")
-                }
-
-                override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate?>?) {}
-                override fun onDataChannel(dataChannel: DataChannel?) {}
-                override fun onRenegotiationNeeded() {
-                    Log.d(TAG, "WEBRTC: onRenegotiationNeeded")
-                    events.trySend(PeerConnectionEvent.RenegotiationNeeded)
-                }
-
-                override fun onAddTrack(
-                    receiver: RtpReceiver,
-                    mediaStreams: Array<out MediaStream?>?
-                ) {
-                    Log.d(TAG, "WEBRTC: onAddTrack: $receiver, $mediaStreams")
-                    events.trySend(PeerConnectionEvent.TrackAdded(receiver))
-                }
-
-                override fun onRemoveTrack(receiver: RtpReceiver) {
-                    Log.d(TAG, "WEBRTC: onRemoveTrack: $receiver")
-                    events.trySend(PeerConnectionEvent.TrackRemoved(receiver))
-                }
-
-                override fun onAddStream(stream: MediaStream) {}
-                override fun onRemoveStream(stream: MediaStream) {}
-
-            })!!
-
-        for (track in localTracks) {
-            conn.addTrack(track)
-            Log.d(TAG, "Adding local track $track")
-        }
-
-        val offer = if (createLocalOffer)
-            conn.suspendCreateOffer(mediaConstraints).also { conn.setLocal(it) }
-        else null
-
-        return PeerConnectionData(
-            state = MemberState(
-                userId = userId,
-                tracks = emptyList(),
-                iceConnectionState = PeerConnection.IceConnectionState.NEW
-            ),
-            conn = conn,
-            events = events,
-        ) to offer
+    suspend fun setLocalStream(stream: MediaStream) {
+        operations.send(Operation.SetLocalStream(stream))
     }
 
-    private suspend fun FlowCollector<Map<String, MemberState>>.handlePeerConnectionEvent(
-        conn: PeerConnectionData,
-        states: States,
-        event: PeerConnectionEvent) {
-        Log.d(TAG, "Received peer connection event $event")
-        when (event) {
-            is PeerConnectionEvent.TrackAdded -> {
-                conn.state =
-                    conn.state.copy(tracks = conn.state.tracks + event.receiver.track()!!)
-                emit(states.peerConnections.collectMemberStates())
-            }
+    private suspend fun serveConnection(
+        remoteUserId: String,
+        states: MutableStateFlow<MemberState>,
+        initialLocalStream: MediaStream?,
+        operationReceiver: ReceiveChannel<Operation>,
+        commandsReceiver: ReceiveChannel<Messages.Command>,
+        commandSender: SendChannel<Messages.ServerMessage>,
+    ) = coroutineScope {
+        val polite = userId > remoteUserId
+        Log.d(TAG, "$remoteUserId: Connection started, polite = $polite")
+        val (observer, eventsReceiver) = createPeerConnectionEventStream()
+        val conn = peerConnectionFactory.createPeerConnection(iceServers, observer)!!
 
-            is PeerConnectionEvent.TrackRemoved -> {
-                conn.state =
-                    conn.state.copy(tracks = conn.state.tracks - event.receiver.track()!!)
-                emit(states.peerConnections.collectMemberStates())
-            }
+        try {
+            initialLocalStream?.let(conn::setLocalStream)
 
-            is PeerConnectionEvent.IceCandidateStateChanged -> {
-                conn.state =
-                    conn.state.copy(iceConnectionState = event.state)
-                emit(states.peerConnections.collectMemberStates())
-            }
+            while (true) {
+                selectUnbiased {
+                    eventsReceiver.onReceive { evt ->
+                        Log.d(TAG, "$remoteUserId: Received event $evt")
+                        when (evt) {
+                            is PeerConnectionEvent.IceCandidateStateChanged -> {}
+                            is PeerConnectionEvent.NewIceCandidate -> {
+                                commandSender.send(
+                                    Messages.ServerMessage.newBuilder()
+                                        .setCommand(Messages.Command.newBuilder()
+                                            .setIceCandidate(evt.iceCandidate.toProtoBuf())
+                                        )
+                                        .setToUser(remoteUserId)
+                                        .build()
+                                )
+                            }
 
-            is PeerConnectionEvent.NewIceCandidate -> {
-                states.commandSender.send(
-                    Messages.Command.newBuilder()
-                        .setIceCandidate(
-                            Messages.IceCandidate.newBuilder()
-                                .setCandidate(event.iceCandidate.sdp)
-                                .setSdpMid(event.iceCandidate.sdpMid)
-                                .setSdpMlineIndex(event.iceCandidate.sdpMLineIndex)
-                        )
-                        .setToUser(conn.state.userId)
-                        .build()
-                )
-            }
+                            PeerConnectionEvent.RenegotiationNeeded -> {
+                                val offer = conn.suspendCreateOffer(mediaConstraints)
 
-            is PeerConnectionEvent.RenegotiationNeeded -> {
-                val message = if (areWeOfferer(conn.state.userId)) {
-                    Messages.Command.newBuilder()
-                        .setOffer(
-                            conn.conn.suspendCreateOffer(
-                                mediaConstraints
-                            ).description
-                        )
-                } else {
-                    Messages.Command.newBuilder().setNegotiationNeeded(true)
-                }.setToUser(conn.state.userId).build()
+                                if (conn.signalingState() != PeerConnection.SignalingState.STABLE) {
+                                    Log.d(TAG, "${remoteUserId}: Ignoring renegotiation")
+                                    return@onReceive
+                                }
 
-                states.commandSender.send(message)
-            }
-        }
-    }
+                                conn.setLocal(offer)
+                                commandSender.send(
+                                    Messages.ServerMessage.newBuilder()
+                                        .setCommand(Messages.Command.newBuilder()
+                                            .setDescription(offer.toProtoBuf())
+                                        )
+                                        .setToUser(remoteUserId)
+                                        .build()
+                                )
+                            }
 
-    private suspend fun FlowCollector<Map<String, MemberState>>.handleIncomingMessage(
-        states: States,
-        m: Messages.ClientMessage
-    ) {
-        Log.d(TAG, "Received incoming $m")
-        when (m.contentCase) {
-            Messages.ClientMessage.ContentCase.STATE_UPDATE -> {
-                // Remove peer connections that are no longer present
-                val toRemove =
-                    states.peerConnections.keys - m.stateUpdate.membersMap.keys
-                for (userId in toRemove) {
-                    states.peerConnections.remove(userId)?.let { conn ->
-                        Log.d(TAG, "Removing $conn")
-                        conn.conn.dispose()
+                            is PeerConnectionEvent.TrackAdded -> {
+                                states.update { it.copy(tracks = it.tracks + evt.receiver.track()!!) }
+                            }
+
+                            is PeerConnectionEvent.TrackRemoved -> {
+                                states.update { it.copy(tracks = it.tracks - evt.receiver.track()!!) }
+                            }
+                        }
                     }
-                }
 
-                // Add new peer connections
-                val toAdd =
-                    m.stateUpdate.membersMap.keys - states.peerConnections.keys - userId
-                for (newUserId in toAdd) {
-                    val createOffer = areWeOfferer(newUserId)
-                    val (conn, initialOffer) =
-                        createPeerConnectionData(newUserId, states.localTracks, createOffer)
-                    states.peerConnections[newUserId] = conn
-                    Log.d(
-                        TAG,
-                        "Creating new PeerConnection to $newUserId, hasOffer = ${initialOffer != null}"
-                    )
+                    commandsReceiver.onReceive { cmd ->
+                        Log.d(TAG, "$remoteUserId: Received command $cmd")
+                        when (cmd.contentCase) {
+                            Messages.Command.ContentCase.DESCRIPTION -> {
+                                val offerCollision = cmd.description.type == Messages.SdpType.OFFER &&
+                                        conn.signalingState() != PeerConnection.SignalingState.STABLE
 
-                    if (initialOffer != null) {
-                        states.commandSender.send(
-                            Messages.Command.newBuilder()
-                                .setToUser(newUserId)
-                                .setOffer(initialOffer.description)
-                                .build()
-                        )
+                                val ignoreOffer = !polite && offerCollision
+                                if (ignoreOffer) {
+                                    Log.d(TAG, "$remoteUserId: Ignoring offer")
+                                    return@onReceive
+                                }
+
+                                if (offerCollision) {
+                                    conn.setLocal(SessionDescription(SessionDescription.Type.ROLLBACK, ""))
+                                }
+
+                                conn.setRemote(cmd.description.toWebRtc())
+
+                                if (cmd.description.type == Messages.SdpType.OFFER) {
+                                    conn.setLocal(conn.suspendCreateAnswer(mediaConstraints))
+                                    commandSender.send(
+                                        Messages.ServerMessage.newBuilder()
+                                            .setCommand(Messages.Command.newBuilder()
+                                                .setDescription(conn.localDescription.toProtoBuf())
+                                            )
+                                            .setToUser(remoteUserId)
+                                            .build()
+                                    )
+                                }
+                            }
+
+                            Messages.Command.ContentCase.ICE_CANDIDATE -> {
+                                conn.addIceCandidate(cmd.iceCandidate.toWebRtc())
+                            }
+
+                            Messages.Command.ContentCase.CONTENT_NOT_SET -> {}
+                        }
                     }
-                }
 
-                emit(states.peerConnections.collectMemberStates())
-            }
-
-            Messages.ClientMessage.ContentCase.OFFER -> {
-                states.peerConnections[m.fromUser]?.conn?.apply {
-                    setRemote(SessionDescription.Type.OFFER, m.offer)
-
-                    val answer = suspendCreateAnswer(mediaConstraints)
-                    setLocal(answer)
-
-                    states.commandSender.send(
-                        Messages.Command.newBuilder()
-                            .setAnswer(answer.description)
-                            .setToUser(m.fromUser)
-                            .build()
-                    )
-                }
-            }
-
-            Messages.ClientMessage.ContentCase.ANSWER -> {
-                states.peerConnections[m.fromUser]?.conn?.setRemote(
-                    type = SessionDescription.Type.ANSWER,
-                    sdp = m.answer
-                )
-            }
-
-            Messages.ClientMessage.ContentCase.ICE_CANDIDATE -> {
-                states.peerConnections[m.fromUser]?.conn?.addIceCandidate(
-                    IceCandidate(
-                        m.iceCandidate.sdpMid,
-                        m.iceCandidate.sdpMlineIndex,
-                        m.iceCandidate.candidate
-                    )
-                )
-            }
-
-            Messages.ClientMessage.ContentCase.NEGOTIATION_NEEDED -> {
-                if (areWeOfferer(m.fromUser)) {
-                    states.peerConnections[m.fromUser]?.conn?.apply {
-                        val newOffer = suspendCreateOffer(mediaConstraints)
-                        setLocal(newOffer)
-                        states.commandSender.send(
-                            Messages.Command.newBuilder()
-                                .setOffer(newOffer.description)
-                                .setToUser(m.fromUser)
-                                .build()
-                        )
+                    operationReceiver.onReceive { op ->
+                        Log.d(TAG, "$remoteUserId: Received operation $op")
+                        when (op) {
+                            is Operation.SetLocalStream -> conn.setLocalStream(op.stream)
+                        }
                     }
                 }
             }
 
-            Messages.ClientMessage.ContentCase.CONTENT_NOT_SET -> {}
-        }
 
-    }
-
-    private suspend fun FlowCollector<Map<String, MemberState>>.handleLocalOperation(
-        states: States,
-        op: Operation
-    ) {
-        Log.d(TAG, "Received operation $op")
-        when (op) {
-            is Operation.AddTrack -> {
-                val result = runCatching {
-                    for (conn in states.peerConnections.values) {
-                        conn.conn.addTrack(op.track)
-                    }
-                }.onFailure {
-                    Log.e(TAG, "Failed to add track", it)
-                }
-
-                states.localTracks += op.track
-                op.callback.send(result)
-            }
+        } finally {
+            Log.d(TAG, "$remoteUserId: Disposing connection")
+            conn.dispose()
         }
     }
-
-    suspend fun setLocalVideoTrack(track: VideoTrack) {
-        val callback = Channel<Result<Unit>>()
-        operations.send(Operation.AddTrack(track, callback))
-        callback.receive().getOrThrow()
-    }
-
-    private fun areWeOfferer(remoteUserId: String): Boolean = userId > remoteUserId
-
-    private fun Map<String, PeerConnectionData>.collectMemberStates(): Map<String, MemberState> {
-        return this.mapValues { it.value.state }
-    }
-
 }

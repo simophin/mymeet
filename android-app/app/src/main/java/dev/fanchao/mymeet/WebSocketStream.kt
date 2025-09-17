@@ -19,7 +19,6 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.selects.selectUnbiased
 
 sealed interface WebSocketConnState {
@@ -35,8 +34,8 @@ fun CoroutineScope.createWebSocketConnection(
     userId: String,
     userName: String,
     client: HttpClient,
-): Triple<SendChannel<Messages.Command>, ReceiveChannel<Messages.ClientMessage>, StateFlow<WebSocketConnState>> {
-    val commandChannel = Channel<Messages.Command>(capacity = 32)
+): Triple<SendChannel<Messages.ServerMessage>, ReceiveChannel<Messages.ClientMessage>, StateFlow<WebSocketConnState>> {
+    val serverMessagesChannel = Channel<Messages.ServerMessage>(capacity = 32)
     val clientMessagesChannel = Channel<Messages.ClientMessage>(capacity = 32)
 
     val states = channelFlow {
@@ -48,7 +47,7 @@ fun CoroutineScope.createWebSocketConnection(
                     room = room,
                     userId = userId,
                     userName = userName,
-                    commandChannel = commandChannel,
+                    severMessageChannel = serverMessagesChannel,
                     clientMessagesChannel = clientMessagesChannel
                 ) {
                     send(WebSocketConnState.Connected)
@@ -56,7 +55,7 @@ fun CoroutineScope.createWebSocketConnection(
 
                 return@channelFlow
             } catch (e: CancellationException) {
-                commandChannel.close()
+                serverMessagesChannel.close()
                 clientMessagesChannel.close()
                 throw e
             } catch (e: Throwable) {
@@ -67,7 +66,7 @@ fun CoroutineScope.createWebSocketConnection(
         }
     }.stateIn(this, SharingStarted.Eagerly, WebSocketConnState.Connecting())
 
-    return Triple(commandChannel, clientMessagesChannel, states)
+    return Triple(serverMessagesChannel, clientMessagesChannel, states)
 }
 
 private suspend fun connect(
@@ -76,7 +75,7 @@ private suspend fun connect(
     room: String,
     userId: String,
     userName: String,
-    commandChannel: ReceiveChannel<Messages.Command>,
+    severMessageChannel: ReceiveChannel<Messages.ServerMessage>,
     clientMessagesChannel: SendChannel<Messages.ClientMessage>,
     connectedCallback: suspend () -> Unit
 ) {
@@ -98,12 +97,12 @@ private suspend fun connect(
 
         while (running) {
             selectUnbiased {
-                commandChannel.onReceiveCatching { cmd ->
+                severMessageChannel.onReceiveCatching { cmd ->
                     if (cmd.isSuccess) {
                         Log.d(TAG, "About to send ws command: ${cmd.getOrThrow()}")
                         send(Frame.Binary(true, cmd.getOrThrow().toByteArray()))
                     } else {
-                        Log.d(TAG, "Command channel closed. Exiting...")
+                        Log.d(TAG, "Command channel closed")
                         close()
                         running = false
                     }

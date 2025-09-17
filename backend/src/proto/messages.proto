@@ -9,9 +9,15 @@ message ClientMessage {
 
   oneof content {
     GroupStateUpdate state_update = 2;
-    string offer = 3;
-    string answer = 4;
-    IceCandidate ice_candidate = 5;
+    Command command = 3;
+  }
+}
+
+message ServerMessage {
+  optional string to_user = 1;
+
+  oneof content {
+    Command command = 2;
   }
 }
 
@@ -24,17 +30,25 @@ message GroupStateUpdate {
 }
 
 message IceCandidate {
-  required string candidate = 2;
-  required int32 sdp_mline_index = 3;
-  optional string sdp_mid = 4;
+  required string sdp = 1;
+  required int32 sdp_mline_index = 2;
+  required string sdp_mid = 3;
+}
+
+enum SdpType {
+  OFFER = 0;
+  ANSWER = 1;
+  PREANSWER = 2;
+}
+
+message SdpDescription {
+  required SdpType type = 1;
+  required string sdp = 2;
 }
 
 message Command {
-  optional string to_user = 1;
-
   oneof content {
-    string offer = 2;
-    string answer = 3;
-    IceCandidate ice_candidate = 4;
+    SdpDescription description = 2;
+    IceCandidate ice_candidate = 3;
   }
 }

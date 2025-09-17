@@ -7,6 +7,9 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.websocket.WebSockets
 import kotlinx.serialization.json.Json
+import org.webrtc.DefaultVideoDecoderFactory
+import org.webrtc.DefaultVideoEncoderFactory
+import org.webrtc.EglBase
 import org.webrtc.Loggable
 import org.webrtc.Logging
 import org.webrtc.PeerConnectionFactory
@@ -20,17 +23,26 @@ class App : Application() {
         })
     }
 
+    val eglBase: EglBase by lazy {
+        EglBase.create()
+    }
+
     val peerConnectionFactory: PeerConnectionFactory by lazy {
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(this)
                 .setInjectableLogger(
-                    { message, severity, tag -> Log.d(tag, message) },
+                    { message, severity, tag -> Log.d("WebRTC", "$tag: $message") },
                     Logging.Severity.LS_INFO
                 )
                 .createInitializationOptions()
         )
 
+        val encoderFactory = DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true)
+        val decoderFactory = DefaultVideoDecoderFactory(eglBase.eglBaseContext)
+
         PeerConnectionFactory.builder()
+            .setVideoEncoderFactory(encoderFactory)
+            .setVideoDecoderFactory(decoderFactory)
             .createPeerConnectionFactory()
     }
 
