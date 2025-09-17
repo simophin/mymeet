@@ -3,6 +3,7 @@ package dev.fanchao.mymeet
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
+import dev.fanchao.mymeet.call.CallSettings
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -21,22 +22,14 @@ class Preferences(appContext: Context, json: Json) {
 
     private val notificationFlow = MutableSharedFlow<String>(extraBufferCapacity = 100)
 
-    val enteredRooms: JsonPreferenceValue<List<String>> = JsonPreferenceValue(
+    val lastUsedCallSettings: JsonPreferenceValue<List<CallSettings>> = JsonPreferenceValue(
         prefs = prefs,
         json = json,
-        key = "enteredRooms",
+        key = "lastUsedCallSettings",
         defaultValue = { emptyList() },
         notificationFlow = notificationFlow,
-        serializer = ListSerializer(String.serializer()),
+        serializer = ListSerializer(CallSettings.serializer()),
     )
-
-    var userId: String?
-        get() = prefs.getString("USER_ID", null)
-        set(value) {
-            prefs.edit {
-                putString("USER_ID", value)
-            }
-        }
 }
 
 class JsonPreferenceValue<T: Any>(

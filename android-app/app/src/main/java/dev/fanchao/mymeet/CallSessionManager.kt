@@ -1,6 +1,7 @@
 package dev.fanchao.mymeet
 
 import android.util.Log
+import dev.fanchao.mymeet.call.CallSettings
 import dev.fanchao.mymeet.proto.Messages
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CoroutineScope
@@ -16,6 +17,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.produceIn
 import kotlinx.coroutines.flow.stateIn
@@ -32,10 +34,7 @@ import org.webrtc.SessionDescription
 private const val TAG = "CallSessionManager"
 
 class CallSessionManager(
-    private val url: String,
-    private val userId: String,
-    private val userName: String,
-    private val room: String,
+    private val settings: CallSettings,
     private val client: HttpClient,
     private val peerConnectionFactory: PeerConnectionFactory,
     private val iceServers: List<PeerConnection.IceServer>,
@@ -69,7 +68,8 @@ class CallSessionManager(
     val memberStates: StateFlow<Map<String, MemberState>> = flow {
         coroutineScope {
             val (commandSender, messageReceiver, connState) = createWebSocketConnection(
-                url = url, room = room, userId = userId, userName = userName, client = client
+                callSettings = settings,
+                client = client
             )
 
             val peerConnections: MutableMap<String, PeerConnectionData> = mutableMapOf()
@@ -92,7 +92,7 @@ class CallSessionManager(
                                     }
 
                                     // Add new peer connections
-                                    (m.stateUpdate.membersMap.keys - peerConnections.keys - userId)
+                                    (m.stateUpdate.membersMap.keys - peerConnections.keys - settings.userId)
                                         .forEach { newUserId ->
                                             val states = MutableStateFlow(
                                                 MemberState(
@@ -181,13 +181,17 @@ class CallSessionManager(
             }
         }
     }.flatMapLatest { peerConnections ->
-        combine(
-            peerConnections
-            .asSequence()
-            .map { (id, data) -> data.states.map { states -> id to states } }
-            .asIterable()
-        ) {
-            it.associate { (id, state) -> id to state }
+        if (peerConnections.isEmpty()) {
+            flowOf(emptyMap())
+        } else {
+            combine(
+                peerConnections
+                    .asSequence()
+                    .map { (id, data) -> data.states.map { states -> id to states } }
+                    .asIterable()
+            ) {
+                it.associate { (id, state) -> id to state }
+            }
         }
     }.stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
@@ -204,7 +208,7 @@ class CallSessionManager(
         commandsReceiver: ReceiveChannel<Messages.Command>,
         commandSender: SendChannel<Messages.ServerMessage>,
     ) = coroutineScope {
-        val polite = userId > remoteUserId
+        val polite = settings.userId > remoteUserId
         Log.d(TAG, "$remoteUserId: Connection started, polite = $polite")
         val (observer, eventsReceiver) = createPeerConnectionEventStream()
         val conn = peerConnectionFactory.createPeerConnection(iceServers, observer)!!

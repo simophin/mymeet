@@ -17,17 +17,20 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import dev.fanchao.mymeet.App.Companion.appInstance
 import dev.fanchao.mymeet.CallSessionManager
+import dev.fanchao.mymeet.call.CallSettings
 import io.getstream.webrtc.android.compose.VideoRenderer
 import kotlinx.serialization.Serializable
 import org.webrtc.Camera2Capturer
-import org.webrtc.EglBase
-import org.webrtc.PeerConnectionFactory
+import org.webrtc.PeerConnection
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoTrack
@@ -37,20 +40,58 @@ import kotlin.math.floor
 
 @Serializable
 data class CallScreenRoute(
+    val serverUrl: String,
     val room: String,
     val userId: String,
     val userName: String,
-    val serverUrl: String
-)
+) {
+    constructor(settings: CallSettings) : this(
+        serverUrl = settings.serverUrl,
+        room = settings.room,
+        userId = settings.userId,
+        userName = settings.userName,
+    )
+
+    fun toCallSettings() = CallSettings(
+        serverUrl = serverUrl,
+        room = room,
+        userId = userId,
+        userName = userName,
+    )
+}
 
 @Composable
-fun CallScreen(
-    callSessionManager: CallSessionManager,
-    peerConnectionFactory: PeerConnectionFactory,
+fun CallScreen(callSettings: CallSettings) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val lifecycleState by lifecycleOwner.lifecycle.currentStateFlow.collectAsState()
+
+    if (lifecycleState.isAtLeast(Lifecycle.State.STARTED)) {
+        Call(callSettings)
+    }
+}
+
+@Composable
+private fun Call(
+    callSettings: CallSettings,
 ) {
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val peerConnectionFactory = context.appInstance.peerConnectionFactory
+    val callSessionManager = remember {
+        CallSessionManager(
+            settings = callSettings,
+            client = context.appInstance.ktorClient,
+            peerConnectionFactory = peerConnectionFactory,
+            scope = scope,
+            iceServers = listOf(
+                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302")
+                    .createIceServer(),
+            )
+        )
+    }
+
     val states by callSessionManager.memberStates.collectAsState()
 
-    val context = LocalContext.current
 
     val eglBaseContext = remember(context) { context.appInstance.eglBase.eglBaseContext }
 
@@ -97,6 +138,7 @@ fun CallScreen(
         callSessionManager.setLocalStream(localStream)
     }
 
+
     val allVideoTracks = remember(states) {
         (localStream.videoTracks.asSequence() +
                 states.values.asSequence().flatMap { it.tracks.asSequence() })
@@ -121,7 +163,9 @@ fun CallScreen(
                             val videoTrack = allVideoTracks.getOrNull(i * numColumns + j)
                             if (videoTrack != null) {
                                 VideoRenderer(
-                                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight(),
                                     videoTrack = videoTrack,
                                     eglBaseContext = eglBaseContext,
                                     rendererEvents = remember {

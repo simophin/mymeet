@@ -1,6 +1,7 @@
 package dev.fanchao.mymeet
 
 import android.util.Log
+import dev.fanchao.mymeet.call.CallSettings
 import dev.fanchao.mymeet.proto.Messages
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.websocket.webSocket
@@ -29,10 +30,7 @@ sealed interface WebSocketConnState {
 private const val TAG = "WebSocketStream"
 
 fun CoroutineScope.createWebSocketConnection(
-    url: String,
-    room: String,
-    userId: String,
-    userName: String,
+    callSettings: CallSettings,
     client: HttpClient,
 ): Triple<SendChannel<Messages.ServerMessage>, ReceiveChannel<Messages.ClientMessage>, StateFlow<WebSocketConnState>> {
     val serverMessagesChannel = Channel<Messages.ServerMessage>(capacity = 32)
@@ -43,10 +41,7 @@ fun CoroutineScope.createWebSocketConnection(
             try {
                 connect(
                     client = client,
-                    url = url,
-                    room = room,
-                    userId = userId,
-                    userName = userName,
+                    settings = callSettings,
                     severMessageChannel = serverMessagesChannel,
                     clientMessagesChannel = clientMessagesChannel
                 ) {
@@ -71,26 +66,23 @@ fun CoroutineScope.createWebSocketConnection(
 
 private suspend fun connect(
     client: HttpClient,
-    url: String,
-    room: String,
-    userId: String,
-    userName: String,
+    settings: CallSettings,
     severMessageChannel: ReceiveChannel<Messages.ServerMessage>,
     clientMessagesChannel: SendChannel<Messages.ClientMessage>,
     connectedCallback: suspend () -> Unit
 ) {
-    Log.d(TAG, "Connecting to $url")
+    Log.d(TAG, "Connecting to ${settings.serverUrl}")
     client.webSocket(
-        urlString = URLBuilder(url)
-            .appendPathSegments("rooms", room)
+        urlString = URLBuilder(settings.serverUrl)
+            .appendPathSegments("rooms", settings.room)
             .toString(),
         request = {
             method = HttpMethod.Get
-            headers["X-User-Id"] = userId
-            headers["X-User-Name"] = userName
+            headers["X-User-Id"] = settings.userId
+            headers["X-User-Name"] = settings.userName
         }
     ) {
-        Log.d(TAG, "Connected to $url")
+        Log.d(TAG, "Connected to ${settings.serverUrl}")
         connectedCallback()
 
         var running = true
